@@ -121,6 +121,40 @@
 
 <article class="post-entry"> 
   <header class="entry-header">
+    <h2>Bitcask
+    </h2>
+  </header>
+  <div class="entry-content">
+    <p>0 首先先吹一下DDIA这本书，众所周知这确实是本好书，特别适合反复阅读，每次读都会有新的体会，毕竟凭我的记忆力，看一遍是肯定记不住的😂。除了书中具体内容之外，每章后面的参考文献也给出了一些经典的论文，非常值得重复阅读，很多设计思想和工业界的实践对于工作中的大多数case都是很有帮助的，毕竟你遇到的坑，大概率已经有前人踩过了。
+前两天下班路上闲得无聊，又找出来翻了翻，在读第三章介绍索引篇章的时候发现，之前阅读的时候对LSM Tree和BTree比较关注，选择性忽略了讲HashTable的内容。作者在介绍HashTable作为索引提及了Bitcask，正好前两天在Github看到有人借鉴Bitcask写的项目，加上我也没有看过Bitcask的具体设计，于是趁这次把Bitcask熟悉了一下。
+这篇论文介绍了Bitcask的设计思想，比较简短，最多花15分钟就能读完，虽然Bitcask设计不算复杂，但是感觉其作为特定场景特定需求下的产物还是挺有趣的，于是想记录下来方便之后查阅。
+Bitcask 需求 Bitcask是Riak的本地存储引擎，在介绍其设计之前先来看一下需求是什么。
+下图是Bitcask的API，我们看到除了open、close、merge、sync等直接操作数据库和文件的接口之外，主要接口有get、put、delete、list_keys、fold等几个。其中get、put、delete都是针对指定key的操作，list_keys和fold是对所有数据的操作。我们可以发现Bitcask除了点查和全量查询，没有提供范围查询的接口，这也正符合了Bitcask通过HashTable作为索引的设计思想。
+除了基本的API外，Bitcask需要处理内存不能完全容纳的数据量，以及满足低延迟、高吞吐、恢复快、易备份等等需求。
+设计 既然内存不能存下所有的数据，那必然需要将文件存储在磁盘，我们先来看下底层文件存储格式是怎样的。
+Bitcask同时只允许有一个可写文件（active file），每条数据以append的形式添加到active file最后，如果active file超过了一定大小，会被close然后生成一个新的active file。每个file其实就是一个日志文件，由于Bitcask的索引是纯内存的形式，也就不需要像LSM Tree或者BTree一样维护WAL&#43;data file这种形式，只要每次重启去恢复内存索引就够了。
+每条记录的format如下图所示，如果是delete记录，其value是一个tombstone。
+随着update和delete操作的增加，data file会包含很多过期的entry，Bitcask通过merge（compaction）来合并老的文件，生成新的文件，只保留最新版本的数据。除了生成新的文件外，还会生成一个hint file，hint file没有记录具体的value，只记录了value pos和size，主要用来加速恢复。
+Bitcask的内存维护一个成为keydir的HashTable索引结构，每一个key对应最新版本的数据信息，包括所在的fileid、value pos、value size和timestamp，从而可以方便地解析出value。
+读操作流程如下图所示
+通过keydir找到查询的key 解析fileid、value pos和value size 从data file解析出对应的value 可以看到，Bitcask的查询都是随机读，如果没有缓存，只是依赖系统的page cache，可能会影响查询的效率。另外对于fold这种需要扫全表的操作，如果全部转成随机读效率也是非常低的。
+对于写操作：
+写入active file 更新keydir 恢复流程也很简单，遍历所有文件，如果有hint file就读hint file，如果没有就读原文件。
+一些不成熟的想法 还没来得及看Bitcask源码，只是在读论文的过程中有一些简单的想法。
+关于缓存 通常来说，如果一个数据库追求性能，一般不会使用操作系统的缓存而是自己来实现，好处是数据库内部更容易知道什么时候是合适的刷盘/换页时机，减少io请求，高效利用缓存。但是Bitcask的设计者考虑到实现内部缓存不确定能带来多大的回报，所以仍然使用文件系统缓存。当然这是10多年前的论文了，现在可能早就实现了自己的缓存管理（未考证）。另外，论文也提到Bitcask本身目标就不是作为一个最快的数据库来进行开发的，而是在有足够的性能的情况下，更多考虑高质量和简单的代码和设计。结合工作中遇到的问题，这点让我感同身受，如果整个项目还在一个复杂、不稳定、低质量代码的泥淖中挣扎，最关键的因素是把复杂度降到可控范围而不是一味的追求更多的功能和更快的性能，不把腿从泥潭里拔出来，跑相同的距离只会浪费更多的体力。
+compaction 论文讲compaction的时候比较简单，只说了将所有老文件合并成一个新的文件，但是这样做的缺点很明显，写放大会很高，而且在过程中会影响到前台的查询。LSM Tree结构的数据库的compaction除了删除过期数据外，还有个考虑是为了提高查询效率。在Bitcask中不需要考虑查询效率，重点在于如何高效删除过期数据，减小写放大。一个想法是可以统计更新/删除操作相对于整体数据量的比例，来作为触发compaction的一个条件，只有当比例比较高的时候才去做compaction。这个比例如果太小，写放大会很严重；如果太大，恢复时间会较长，需要通过实际测试和使用场景来确定。
+恢复 论文讲恢复的时候说会把所有文件都读一遍，然后尝试添加到keydir里面，其实可以记录一下文件属性，比如timestamp range。在恢复的时候从较新的文件开始，如果一个key在多个文件里都有，之前已经读到了这个key的update或delete，之后在较老的文件里就可以略过，加快恢复的速度。
+fold 如果数据量很大，大量的随机读会严重影响查询性能。
+其他 在一些容忍丢失数据的场景下，可以合并写入；数据压缩。
+总结 Bitcask不是一个全能的数据库，而是为了满足特定需求设计的。Bitcask的设计非常精炼，实现了log-structured file 实现了高效的写入，通过in-memory hash table实现了高效读取。但是使用场景比较有限，内存必须要容纳下所有的key。个人觉得比较适合拿来练手，熟悉磁盘文件管理、读写、并发。
+参考文献 https://riak.com/assets/bitcask-intro.pdf </p>
+  </div>
+  <footer class="entry-footer"><span title='2022-09-28 22:02:16 +0800 CST'>September 28, 2022</span>&nbsp;·&nbsp;1 min</footer>
+  <a class="entry-link" aria-label="post link to Bitcask" href="http://sunby.github.io/posts/bitcask/"></a>
+</article>
+
+<article class="post-entry"> 
+  <header class="entry-header">
     <h2>2021 年终总结
     </h2>
   </header>
@@ -138,7 +172,7 @@ Milvus这个项目想说的有很多（总结里就不写优点了，主要写�
 参考资料 https://github.com/milvus-io/milvus https://15445.courses.cs.cmu.edu/fall2021/ https://github.com/pingcap/tidb https://github.com/tikv/pd https://github.com/tikv/tikv https://dataintensive.net/ </p>
   </div>
   <footer class="entry-footer"><span title='2021-12-31 16:00:33 +0800 CST'>December 31, 2021</span>&nbsp;·&nbsp;1 min</footer>
-  <a class="entry-link" aria-label="post link to 2021 年终总结" href="http://sunby.github.io/posts/2021_summary/2021-12-31-2021_summary/"></a>
+  <a class="entry-link" aria-label="post link to 2021 年终总结" href="http://sunby.github.io/posts/2021-12-31-2021_summary/"></a>
 </article>
     </main>
     

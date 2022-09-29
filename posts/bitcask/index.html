@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en" dir="auto">
+
+<head><meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+<meta name="robots" content="index, follow">
+<title>Bitcask | Sunby&#39;s Blog</title>
+<meta name="keywords" content="Paper, Database">
+<meta name="description" content="0 首先先吹一下DDIA这本书，众所周知这确实是本好书，特别适合反复阅读，每次读都会有新的体会，毕竟凭我的记忆力，看一遍是肯定记不住的😂。除了书中具体内容之外，每章后面的参考文献也给出了一些经典的论文，非常值得重复阅读，很多设计思想和工业界的实践对于工作中的大多数case都是很有帮助的，毕竟你遇到的坑，大概率已经有前人踩过了。
+前两天下班路上闲得无聊，又找出来翻了翻，在读第三章介绍索引篇章的时候发现，之前阅读的时候对LSM Tree和BTree比较关注，选择性忽略了讲HashTable的内容。作者在介绍HashTable作为索引提及了Bitcask，正好前两天在Github看到有人借鉴Bitcask写的项目，加上我也没有看过Bitcask的具体设计，于是趁这次把Bitcask熟悉了一下。
+这篇论文介绍了Bitcask的设计思想，比较简短，最多花15分钟就能读完，虽然Bitcask设计不算复杂，但是感觉其作为特定场景特定需求下的产物还是挺有趣的，于是想记录下来方便之后查阅。
+Bitcask 需求 Bitcask是Riak的本地存储引擎，在介绍其设计之前先来看一下需求是什么。
+下图是Bitcask的API，我们看到除了open、close、merge、sync等直接操作数据库和文件的接口之外，主要接口有get、put、delete、list_keys、fold等几个。其中get、put、delete都是针对指定key的操作，list_keys和fold是对所有数据的操作。我们可以发现Bitcask除了点查和全量查询，没有提供范围查询的接口，这也正符合了Bitcask通过HashTable作为索引的设计思想。
+除了基本的API外，Bitcask需要处理内存不能完全容纳的数据量，以及满足低延迟、高吞吐、恢复快、易备份等等需求。
+设计 既然内存不能存下所有的数据，那必然需要将文件存储在磁盘，我们先来看下底层文件存储格式是怎样的。
+Bitcask同时只允许有一个可写文件（active file），每条数据以append的形式添加到active file最后，如果active file超过了一定大小，会被close然后生成一个新的active file。每个file其实就是一个日志文件，由于Bitcask的索引是纯内存的形式，也就不需要像LSM Tree或者BTree一样维护WAL&#43;data file这种形式，只要每次重启去恢复内存索引就够了。
+每条记录的format如下图所示，如果是delete记录，其value是一个tombstone。
+随着update和delete操作的增加，data file会包含很多过期的entry，Bitcask通过merge（compaction）来合并老的文件，生成新的文件，只保留最新版本的数据。除了生成新的文件外，还会生成一个hint file，hint file没有记录具体的value，只记录了value pos和size，主要用来加速恢复。
+Bitcask的内存维护一个成为keydir的HashTable索引结构，每一个key对应最新版本的数据信息，包括所在的fileid、value pos、value size和timestamp，从而可以方便地解析出value。
+读操作流程如下图所示
+通过keydir找到查询的key 解析fileid、value pos和value size 从data file解析出对应的value 可以看到，Bitcask的查询都是随机读，如果没有缓存，只是依赖系统的page cache，可能会影响查询的效率。另外对于fold这种需要扫全表的操作，如果全部转成随机读效率也是非常低的。
+对于写操作：
+写入active file 更新keydir 恢复流程也很简单，遍历所有文件，如果有hint file就读hint file，如果没有就读原文件。
+一些不成熟的想法 还没来得及看Bitcask源码，只是在读论文的过程中有一些简单的想法。
+关于缓存 通常来说，如果一个数据库追求性能，一般不会使用操作系统的缓存而是自己来实现，好处是数据库内部更容易知道什么时候是合适的刷盘/换页时机，减少io请求，高效利用缓存。但是Bitcask的设计者考虑到实现内部缓存不确定能带来多大的回报，所以仍然使用文件系统缓存。当然这是10多年前的论文了，现在可能早就实现了自己的缓存管理（未考证）。另外，论文也提到Bitcask本身目标就不是作为一个最快的数据库来进行开发的，而是在有足够的性能的情况下，更多考虑高质量和简单的代码和设计。结合工作中遇到的问题，这点让我感同身受，如果整个项目还在一个复杂、不稳定、低质量代码的泥淖中挣扎，最关键的因素是把复杂度降到可控范围而不是一味的追求更多的功能和更快的性能，不把腿从泥潭里拔出来，跑相同的距离只会浪费更多的体力。
+compaction 论文讲compaction的时候比较简单，只说了将所有老文件合并成一个新的文件，但是这样做的缺点很明显，写放大会很高，而且在过程中会影响到前台的查询。LSM Tree结构的数据库的compaction除了删除过期数据外，还有个考虑是为了提高查询效率。在Bitcask中不需要考虑查询效率，重点在于如何高效删除过期数据，减小写放大。一个想法是可以统计更新/删除操作相对于整体数据量的比例，来作为触发compaction的一个条件，只有当比例比较高的时候才去做compaction。这个比例如果太小，写放大会很严重；如果太大，恢复时间会较长，需要通过实际测试和使用场景来确定。
+恢复 论文讲恢复的时候说会把所有文件都读一遍，然后尝试添加到keydir里面，其实可以记录一下文件属性，比如timestamp range。在恢复的时候从较新的文件开始，如果一个key在多个文件里都有，之前已经读到了这个key的update或delete，之后在较老的文件里就可以略过，加快恢复的速度。
+fold 如果数据量很大，大量的随机读会严重影响查询性能。
+其他 在一些容忍丢失数据的场景下，可以合并写入；数据压缩。
+总结 Bitcask不是一个全能的数据库，而是为了满足特定需求设计的。Bitcask的设计非常精炼，实现了log-structured file 实现了高效的写入，通过in-memory hash table实现了高效读取。但是使用场景比较有限，内存必须要容纳下所有的key。个人觉得比较适合拿来练手，熟悉磁盘文件管理、读写、并发。
+参考文献 https://riak.com/assets/bitcask-intro.pdf ">
+<meta name="author" content="">
+<link rel="canonical" href="http://sunby.github.io/posts/bitcask/">
+<link crossorigin="anonymous" href="/assets/css/stylesheet.bc1149f4a72aa4858d3a9f71462f75e5884ffe8073ea9d6d5761d5663d651e20.css" integrity="sha256-vBFJ9KcqpIWNOp9xRi915YhP/oBz6p1tV2HVZj1lHiA=" rel="preload stylesheet" as="style">
+<script defer crossorigin="anonymous" src="/assets/js/highlight.f413e19d0714851f6474e7ee9632408e58ac146fbdbe62747134bea2fa3415e0.js" integrity="sha256-9BPhnQcUhR9kdOfuljJAjlisFG&#43;9vmJ0cTS&#43;ovo0FeA="
+    onload="hljs.initHighlightingOnLoad();"></script>
+<link rel="icon" href="http://sunby.github.io/favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="http://sunby.github.io/favicon-16x16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="http://sunby.github.io/favicon-32x32.png">
+<link rel="apple-touch-icon" href="http://sunby.github.io/apple-touch-icon.png">
+<link rel="mask-icon" href="http://sunby.github.io/safari-pinned-tab.svg">
+<meta name="theme-color" content="#2e2e33">
+<meta name="msapplication-TileColor" content="#2e2e33">
+<noscript>
+    <style>
+        #theme-toggle,
+        .top-link {
+            display: none;
+        }
+
+    </style>
+</noscript><meta property="og:title" content="Bitcask" />
+<meta property="og:description" content="0 首先先吹一下DDIA这本书，众所周知这确实是本好书，特别适合反复阅读，每次读都会有新的体会，毕竟凭我的记忆力，看一遍是肯定记不住的😂。除了书中具体内容之外，每章后面的参考文献也给出了一些经典的论文，非常值得重复阅读，很多设计思想和工业界的实践对于工作中的大多数case都是很有帮助的，毕竟你遇到的坑，大概率已经有前人踩过了。
+前两天下班路上闲得无聊，又找出来翻了翻，在读第三章介绍索引篇章的时候发现，之前阅读的时候对LSM Tree和BTree比较关注，选择性忽略了讲HashTable的内容。作者在介绍HashTable作为索引提及了Bitcask，正好前两天在Github看到有人借鉴Bitcask写的项目，加上我也没有看过Bitcask的具体设计，于是趁这次把Bitcask熟悉了一下。
+这篇论文介绍了Bitcask的设计思想，比较简短，最多花15分钟就能读完，虽然Bitcask设计不算复杂，但是感觉其作为特定场景特定需求下的产物还是挺有趣的，于是想记录下来方便之后查阅。
+Bitcask 需求 Bitcask是Riak的本地存储引擎，在介绍其设计之前先来看一下需求是什么。
+下图是Bitcask的API，我们看到除了open、close、merge、sync等直接操作数据库和文件的接口之外，主要接口有get、put、delete、list_keys、fold等几个。其中get、put、delete都是针对指定key的操作，list_keys和fold是对所有数据的操作。我们可以发现Bitcask除了点查和全量查询，没有提供范围查询的接口，这也正符合了Bitcask通过HashTable作为索引的设计思想。
+除了基本的API外，Bitcask需要处理内存不能完全容纳的数据量，以及满足低延迟、高吞吐、恢复快、易备份等等需求。
+设计 既然内存不能存下所有的数据，那必然需要将文件存储在磁盘，我们先来看下底层文件存储格式是怎样的。
+Bitcask同时只允许有一个可写文件（active file），每条数据以append的形式添加到active file最后，如果active file超过了一定大小，会被close然后生成一个新的active file。每个file其实就是一个日志文件，由于Bitcask的索引是纯内存的形式，也就不需要像LSM Tree或者BTree一样维护WAL&#43;data file这种形式，只要每次重启去恢复内存索引就够了。
+每条记录的format如下图所示，如果是delete记录，其value是一个tombstone。
+随着update和delete操作的增加，data file会包含很多过期的entry，Bitcask通过merge（compaction）来合并老的文件，生成新的文件，只保留最新版本的数据。除了生成新的文件外，还会生成一个hint file，hint file没有记录具体的value，只记录了value pos和size，主要用来加速恢复。
+Bitcask的内存维护一个成为keydir的HashTable索引结构，每一个key对应最新版本的数据信息，包括所在的fileid、value pos、value size和timestamp，从而可以方便地解析出value。
+读操作流程如下图所示
+通过keydir找到查询的key 解析fileid、value pos和value size 从data file解析出对应的value 可以看到，Bitcask的查询都是随机读，如果没有缓存，只是依赖系统的page cache，可能会影响查询的效率。另外对于fold这种需要扫全表的操作，如果全部转成随机读效率也是非常低的。
+对于写操作：
+写入active file 更新keydir 恢复流程也很简单，遍历所有文件，如果有hint file就读hint file，如果没有就读原文件。
+一些不成熟的想法 还没来得及看Bitcask源码，只是在读论文的过程中有一些简单的想法。
+关于缓存 通常来说，如果一个数据库追求性能，一般不会使用操作系统的缓存而是自己来实现，好处是数据库内部更容易知道什么时候是合适的刷盘/换页时机，减少io请求，高效利用缓存。但是Bitcask的设计者考虑到实现内部缓存不确定能带来多大的回报，所以仍然使用文件系统缓存。当然这是10多年前的论文了，现在可能早就实现了自己的缓存管理（未考证）。另外，论文也提到Bitcask本身目标就不是作为一个最快的数据库来进行开发的，而是在有足够的性能的情况下，更多考虑高质量和简单的代码和设计。结合工作中遇到的问题，这点让我感同身受，如果整个项目还在一个复杂、不稳定、低质量代码的泥淖中挣扎，最关键的因素是把复杂度降到可控范围而不是一味的追求更多的功能和更快的性能，不把腿从泥潭里拔出来，跑相同的距离只会浪费更多的体力。
+compaction 论文讲compaction的时候比较简单，只说了将所有老文件合并成一个新的文件，但是这样做的缺点很明显，写放大会很高，而且在过程中会影响到前台的查询。LSM Tree结构的数据库的compaction除了删除过期数据外，还有个考虑是为了提高查询效率。在Bitcask中不需要考虑查询效率，重点在于如何高效删除过期数据，减小写放大。一个想法是可以统计更新/删除操作相对于整体数据量的比例，来作为触发compaction的一个条件，只有当比例比较高的时候才去做compaction。这个比例如果太小，写放大会很严重；如果太大，恢复时间会较长，需要通过实际测试和使用场景来确定。
+恢复 论文讲恢复的时候说会把所有文件都读一遍，然后尝试添加到keydir里面，其实可以记录一下文件属性，比如timestamp range。在恢复的时候从较新的文件开始，如果一个key在多个文件里都有，之前已经读到了这个key的update或delete，之后在较老的文件里就可以略过，加快恢复的速度。
+fold 如果数据量很大，大量的随机读会严重影响查询性能。
+其他 在一些容忍丢失数据的场景下，可以合并写入；数据压缩。
+总结 Bitcask不是一个全能的数据库，而是为了满足特定需求设计的。Bitcask的设计非常精炼，实现了log-structured file 实现了高效的写入，通过in-memory hash table实现了高效读取。但是使用场景比较有限，内存必须要容纳下所有的key。个人觉得比较适合拿来练手，熟悉磁盘文件管理、读写、并发。
+参考文献 https://riak.com/assets/bitcask-intro.pdf " />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="http://sunby.github.io/posts/bitcask/" /><meta property="article:section" content="posts" />
+<meta property="article:published_time" content="2022-09-28T22:02:16+08:00" />
+<meta property="article:modified_time" content="2022-09-28T22:02:16+08:00" />
+
+<meta name="twitter:card" content="summary"/>
+<meta name="twitter:title" content="Bitcask"/>
+<meta name="twitter:description" content="0 首先先吹一下DDIA这本书，众所周知这确实是本好书，特别适合反复阅读，每次读都会有新的体会，毕竟凭我的记忆力，看一遍是肯定记不住的😂。除了书中具体内容之外，每章后面的参考文献也给出了一些经典的论文，非常值得重复阅读，很多设计思想和工业界的实践对于工作中的大多数case都是很有帮助的，毕竟你遇到的坑，大概率已经有前人踩过了。
+前两天下班路上闲得无聊，又找出来翻了翻，在读第三章介绍索引篇章的时候发现，之前阅读的时候对LSM Tree和BTree比较关注，选择性忽略了讲HashTable的内容。作者在介绍HashTable作为索引提及了Bitcask，正好前两天在Github看到有人借鉴Bitcask写的项目，加上我也没有看过Bitcask的具体设计，于是趁这次把Bitcask熟悉了一下。
+这篇论文介绍了Bitcask的设计思想，比较简短，最多花15分钟就能读完，虽然Bitcask设计不算复杂，但是感觉其作为特定场景特定需求下的产物还是挺有趣的，于是想记录下来方便之后查阅。
+Bitcask 需求 Bitcask是Riak的本地存储引擎，在介绍其设计之前先来看一下需求是什么。
+下图是Bitcask的API，我们看到除了open、close、merge、sync等直接操作数据库和文件的接口之外，主要接口有get、put、delete、list_keys、fold等几个。其中get、put、delete都是针对指定key的操作，list_keys和fold是对所有数据的操作。我们可以发现Bitcask除了点查和全量查询，没有提供范围查询的接口，这也正符合了Bitcask通过HashTable作为索引的设计思想。
+除了基本的API外，Bitcask需要处理内存不能完全容纳的数据量，以及满足低延迟、高吞吐、恢复快、易备份等等需求。
+设计 既然内存不能存下所有的数据，那必然需要将文件存储在磁盘，我们先来看下底层文件存储格式是怎样的。
+Bitcask同时只允许有一个可写文件（active file），每条数据以append的形式添加到active file最后，如果active file超过了一定大小，会被close然后生成一个新的active file。每个file其实就是一个日志文件，由于Bitcask的索引是纯内存的形式，也就不需要像LSM Tree或者BTree一样维护WAL&#43;data file这种形式，只要每次重启去恢复内存索引就够了。
+每条记录的format如下图所示，如果是delete记录，其value是一个tombstone。
+随着update和delete操作的增加，data file会包含很多过期的entry，Bitcask通过merge（compaction）来合并老的文件，生成新的文件，只保留最新版本的数据。除了生成新的文件外，还会生成一个hint file，hint file没有记录具体的value，只记录了value pos和size，主要用来加速恢复。
+Bitcask的内存维护一个成为keydir的HashTable索引结构，每一个key对应最新版本的数据信息，包括所在的fileid、value pos、value size和timestamp，从而可以方便地解析出value。
+读操作流程如下图所示
+通过keydir找到查询的key 解析fileid、value pos和value size 从data file解析出对应的value 可以看到，Bitcask的查询都是随机读，如果没有缓存，只是依赖系统的page cache，可能会影响查询的效率。另外对于fold这种需要扫全表的操作，如果全部转成随机读效率也是非常低的。
+对于写操作：
+写入active file 更新keydir 恢复流程也很简单，遍历所有文件，如果有hint file就读hint file，如果没有就读原文件。
+一些不成熟的想法 还没来得及看Bitcask源码，只是在读论文的过程中有一些简单的想法。
+关于缓存 通常来说，如果一个数据库追求性能，一般不会使用操作系统的缓存而是自己来实现，好处是数据库内部更容易知道什么时候是合适的刷盘/换页时机，减少io请求，高效利用缓存。但是Bitcask的设计者考虑到实现内部缓存不确定能带来多大的回报，所以仍然使用文件系统缓存。当然这是10多年前的论文了，现在可能早就实现了自己的缓存管理（未考证）。另外，论文也提到Bitcask本身目标就不是作为一个最快的数据库来进行开发的，而是在有足够的性能的情况下，更多考虑高质量和简单的代码和设计。结合工作中遇到的问题，这点让我感同身受，如果整个项目还在一个复杂、不稳定、低质量代码的泥淖中挣扎，最关键的因素是把复杂度降到可控范围而不是一味的追求更多的功能和更快的性能，不把腿从泥潭里拔出来，跑相同的距离只会浪费更多的体力。
+compaction 论文讲compaction的时候比较简单，只说了将所有老文件合并成一个新的文件，但是这样做的缺点很明显，写放大会很高，而且在过程中会影响到前台的查询。LSM Tree结构的数据库的compaction除了删除过期数据外，还有个考虑是为了提高查询效率。在Bitcask中不需要考虑查询效率，重点在于如何高效删除过期数据，减小写放大。一个想法是可以统计更新/删除操作相对于整体数据量的比例，来作为触发compaction的一个条件，只有当比例比较高的时候才去做compaction。这个比例如果太小，写放大会很严重；如果太大，恢复时间会较长，需要通过实际测试和使用场景来确定。
+恢复 论文讲恢复的时候说会把所有文件都读一遍，然后尝试添加到keydir里面，其实可以记录一下文件属性，比如timestamp range。在恢复的时候从较新的文件开始，如果一个key在多个文件里都有，之前已经读到了这个key的update或delete，之后在较老的文件里就可以略过，加快恢复的速度。
+fold 如果数据量很大，大量的随机读会严重影响查询性能。
+其他 在一些容忍丢失数据的场景下，可以合并写入；数据压缩。
+总结 Bitcask不是一个全能的数据库，而是为了满足特定需求设计的。Bitcask的设计非常精炼，实现了log-structured file 实现了高效的写入，通过in-memory hash table实现了高效读取。但是使用场景比较有限，内存必须要容纳下所有的key。个人觉得比较适合拿来练手，熟悉磁盘文件管理、读写、并发。
+参考文献 https://riak.com/assets/bitcask-intro.pdf "/>
+
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position":  1 ,
+      "name": "Posts",
+      "item": "http://sunby.github.io/posts/"
+    }, 
+    {
+      "@type": "ListItem",
+      "position":  2 ,
+      "name": "Bitcask",
+      "item": "http://sunby.github.io/posts/bitcask/"
+    }
+  ]
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Bitcask",
+  "name": "Bitcask",
+  "description": "0 首先先吹一下DDIA这本书，众所周知这确实是本好书，特别适合反复阅读，每次读都会有新的体会，毕竟凭我的记忆力，看一遍是肯定记不住的😂。除了书中具体内容之外，每章后面的参考文献也给出了一些经典的论文，非常值得重复阅读，很多设计思想和工业界的实践对于工作中的大多数case都是很有帮助的，毕竟你遇到的坑，大概率已经有前人踩过了。\n前两天下班路上闲得无聊，又找出来翻了翻，在读第三章介绍索引篇章的时候发现，之前阅读的时候对LSM Tree和BTree比较关注，选择性忽略了讲HashTable的内容。作者在介绍HashTable作为索引提及了Bitcask，正好前两天在Github看到有人借鉴Bitcask写的项目，加上我也没有看过Bitcask的具体设计，于是趁这次把Bitcask熟悉了一下。\n这篇论文介绍了Bitcask的设计思想，比较简短，最多花15分钟就能读完，虽然Bitcask设计不算复杂，但是感觉其作为特定场景特定需求下的产物还是挺有趣的，于是想记录下来方便之后查阅。\nBitcask 需求 Bitcask是Riak的本地存储引擎，在介绍其设计之前先来看一下需求是什么。\n下图是Bitcask的API，我们看到除了open、close、merge、sync等直接操作数据库和文件的接口之外，主要接口有get、put、delete、list_keys、fold等几个。其中get、put、delete都是针对指定key的操作，list_keys和fold是对所有数据的操作。我们可以发现Bitcask除了点查和全量查询，没有提供范围查询的接口，这也正符合了Bitcask通过HashTable作为索引的设计思想。\n除了基本的API外，Bitcask需要处理内存不能完全容纳的数据量，以及满足低延迟、高吞吐、恢复快、易备份等等需求。\n设计 既然内存不能存下所有的数据，那必然需要将文件存储在磁盘，我们先来看下底层文件存储格式是怎样的。\nBitcask同时只允许有一个可写文件（active file），每条数据以append的形式添加到active file最后，如果active file超过了一定大小，会被close然后生成一个新的active file。每个file其实就是一个日志文件，由于Bitcask的索引是纯内存的形式，也就不需要像LSM Tree或者BTree一样维护WAL+data file这种形式，只要每次重启去恢复内存索引就够了。\n每条记录的format如下图所示，如果是delete记录，其value是一个tombstone。\n随着update和delete操作的增加，data file会包含很多过期的entry，Bitcask通过merge（compaction）来合并老的文件，生成新的文件，只保留最新版本的数据。除了生成新的文件外，还会生成一个hint file，hint file没有记录具体的value，只记录了value pos和size，主要用来加速恢复。\nBitcask的内存维护一个成为keydir的HashTable索引结构，每一个key对应最新版本的数据信息，包括所在的fileid、value pos、value size和timestamp，从而可以方便地解析出value。\n读操作流程如下图所示\n通过keydir找到查询的key 解析fileid、value pos和value size 从data file解析出对应的value 可以看到，Bitcask的查询都是随机读，如果没有缓存，只是依赖系统的page cache，可能会影响查询的效率。另外对于fold这种需要扫全表的操作，如果全部转成随机读效率也是非常低的。\n对于写操作：\n写入active file 更新keydir 恢复流程也很简单，遍历所有文件，如果有hint file就读hint file，如果没有就读原文件。\n一些不成熟的想法 还没来得及看Bitcask源码，只是在读论文的过程中有一些简单的想法。\n关于缓存 通常来说，如果一个数据库追求性能，一般不会使用操作系统的缓存而是自己来实现，好处是数据库内部更容易知道什么时候是合适的刷盘/换页时机，减少io请求，高效利用缓存。但是Bitcask的设计者考虑到实现内部缓存不确定能带来多大的回报，所以仍然使用文件系统缓存。当然这是10多年前的论文了，现在可能早就实现了自己的缓存管理（未考证）。另外，论文也提到Bitcask本身目标就不是作为一个最快的数据库来进行开发的，而是在有足够的性能的情况下，更多考虑高质量和简单的代码和设计。结合工作中遇到的问题，这点让我感同身受，如果整个项目还在一个复杂、不稳定、低质量代码的泥淖中挣扎，最关键的因素是把复杂度降到可控范围而不是一味的追求更多的功能和更快的性能，不把腿从泥潭里拔出来，跑相同的距离只会浪费更多的体力。\ncompaction 论文讲compaction的时候比较简单，只说了将所有老文件合并成一个新的文件，但是这样做的缺点很明显，写放大会很高，而且在过程中会影响到前台的查询。LSM Tree结构的数据库的compaction除了删除过期数据外，还有个考虑是为了提高查询效率。在Bitcask中不需要考虑查询效率，重点在于如何高效删除过期数据，减小写放大。一个想法是可以统计更新/删除操作相对于整体数据量的比例，来作为触发compaction的一个条件，只有当比例比较高的时候才去做compaction。这个比例如果太小，写放大会很严重；如果太大，恢复时间会较长，需要通过实际测试和使用场景来确定。\n恢复 论文讲恢复的时候说会把所有文件都读一遍，然后尝试添加到keydir里面，其实可以记录一下文件属性，比如timestamp range。在恢复的时候从较新的文件开始，如果一个key在多个文件里都有，之前已经读到了这个key的update或delete，之后在较老的文件里就可以略过，加快恢复的速度。\nfold 如果数据量很大，大量的随机读会严重影响查询性能。\n其他 在一些容忍丢失数据的场景下，可以合并写入；数据压缩。\n总结 Bitcask不是一个全能的数据库，而是为了满足特定需求设计的。Bitcask的设计非常精炼，实现了log-structured file 实现了高效的写入，通过in-memory hash table实现了高效读取。但是使用场景比较有限，内存必须要容纳下所有的key。个人觉得比较适合拿来练手，熟悉磁盘文件管理、读写、并发。\n参考文献 https://riak.com/assets/bitcask-intro.pdf ",
+  "keywords": [
+    "Paper", "Database"
+  ],
+  "articleBody": "0 首先先吹一下DDIA这本书，众所周知这确实是本好书，特别适合反复阅读，每次读都会有新的体会，毕竟凭我的记忆力，看一遍是肯定记不住的😂。除了书中具体内容之外，每章后面的参考文献也给出了一些经典的论文，非常值得重复阅读，很多设计思想和工业界的实践对于工作中的大多数case都是很有帮助的，毕竟你遇到的坑，大概率已经有前人踩过了。\n前两天下班路上闲得无聊，又找出来翻了翻，在读第三章介绍索引篇章的时候发现，之前阅读的时候对LSM Tree和BTree比较关注，选择性忽略了讲HashTable的内容。作者在介绍HashTable作为索引提及了Bitcask，正好前两天在Github看到有人借鉴Bitcask写的项目，加上我也没有看过Bitcask的具体设计，于是趁这次把Bitcask熟悉了一下。\n这篇论文介绍了Bitcask的设计思想，比较简短，最多花15分钟就能读完，虽然Bitcask设计不算复杂，但是感觉其作为特定场景特定需求下的产物还是挺有趣的，于是想记录下来方便之后查阅。\nBitcask 需求 Bitcask是Riak的本地存储引擎，在介绍其设计之前先来看一下需求是什么。\n下图是Bitcask的API，我们看到除了open、close、merge、sync等直接操作数据库和文件的接口之外，主要接口有get、put、delete、list_keys、fold等几个。其中get、put、delete都是针对指定key的操作，list_keys和fold是对所有数据的操作。我们可以发现Bitcask除了点查和全量查询，没有提供范围查询的接口，这也正符合了Bitcask通过HashTable作为索引的设计思想。\n除了基本的API外，Bitcask需要处理内存不能完全容纳的数据量，以及满足低延迟、高吞吐、恢复快、易备份等等需求。\n设计 既然内存不能存下所有的数据，那必然需要将文件存储在磁盘，我们先来看下底层文件存储格式是怎样的。\nBitcask同时只允许有一个可写文件（active file），每条数据以append的形式添加到active file最后，如果active file超过了一定大小，会被close然后生成一个新的active file。每个file其实就是一个日志文件，由于Bitcask的索引是纯内存的形式，也就不需要像LSM Tree或者BTree一样维护WAL+data file这种形式，只要每次重启去恢复内存索引就够了。\n每条记录的format如下图所示，如果是delete记录，其value是一个tombstone。\n随着update和delete操作的增加，data file会包含很多过期的entry，Bitcask通过merge（compaction）来合并老的文件，生成新的文件，只保留最新版本的数据。除了生成新的文件外，还会生成一个hint file，hint file没有记录具体的value，只记录了value pos和size，主要用来加速恢复。\nBitcask的内存维护一个成为keydir的HashTable索引结构，每一个key对应最新版本的数据信息，包括所在的fileid、value pos、value size和timestamp，从而可以方便地解析出value。\n读操作流程如下图所示\n通过keydir找到查询的key 解析fileid、value pos和value size 从data file解析出对应的value 可以看到，Bitcask的查询都是随机读，如果没有缓存，只是依赖系统的page cache，可能会影响查询的效率。另外对于fold这种需要扫全表的操作，如果全部转成随机读效率也是非常低的。\n对于写操作：\n写入active file 更新keydir 恢复流程也很简单，遍历所有文件，如果有hint file就读hint file，如果没有就读原文件。\n一些不成熟的想法 还没来得及看Bitcask源码，只是在读论文的过程中有一些简单的想法。\n关于缓存 通常来说，如果一个数据库追求性能，一般不会使用操作系统的缓存而是自己来实现，好处是数据库内部更容易知道什么时候是合适的刷盘/换页时机，减少io请求，高效利用缓存。但是Bitcask的设计者考虑到实现内部缓存不确定能带来多大的回报，所以仍然使用文件系统缓存。当然这是10多年前的论文了，现在可能早就实现了自己的缓存管理（未考证）。另外，论文也提到Bitcask本身目标就不是作为一个最快的数据库来进行开发的，而是在有足够的性能的情况下，更多考虑高质量和简单的代码和设计。结合工作中遇到的问题，这点让我感同身受，如果整个项目还在一个复杂、不稳定、低质量代码的泥淖中挣扎，最关键的因素是把复杂度降到可控范围而不是一味的追求更多的功能和更快的性能，不把腿从泥潭里拔出来，跑相同的距离只会浪费更多的体力。\ncompaction 论文讲compaction的时候比较简单，只说了将所有老文件合并成一个新的文件，但是这样做的缺点很明显，写放大会很高，而且在过程中会影响到前台的查询。LSM Tree结构的数据库的compaction除了删除过期数据外，还有个考虑是为了提高查询效率。在Bitcask中不需要考虑查询效率，重点在于如何高效删除过期数据，减小写放大。一个想法是可以统计更新/删除操作相对于整体数据量的比例，来作为触发compaction的一个条件，只有当比例比较高的时候才去做compaction。这个比例如果太小，写放大会很严重；如果太大，恢复时间会较长，需要通过实际测试和使用场景来确定。\n恢复 论文讲恢复的时候说会把所有文件都读一遍，然后尝试添加到keydir里面，其实可以记录一下文件属性，比如timestamp range。在恢复的时候从较新的文件开始，如果一个key在多个文件里都有，之前已经读到了这个key的update或delete，之后在较老的文件里就可以略过，加快恢复的速度。\nfold 如果数据量很大，大量的随机读会严重影响查询性能。\n其他 在一些容忍丢失数据的场景下，可以合并写入；数据压缩。\n总结 Bitcask不是一个全能的数据库，而是为了满足特定需求设计的。Bitcask的设计非常精炼，实现了log-structured file 实现了高效的写入，通过in-memory hash table实现了高效读取。但是使用场景比较有限，内存必须要容纳下所有的key。个人觉得比较适合拿来练手，熟悉磁盘文件管理、读写、并发。\n参考文献 https://riak.com/assets/bitcask-intro.pdf ",
+  "wordCount" : "66",
+  "inLanguage": "en",
+  "datePublished": "2022-09-28T22:02:16+08:00",
+  "dateModified": "2022-09-28T22:02:16+08:00",
+  "mainEntityOfPage": {
+    "@type": "WebPage",
+    "@id": "http://sunby.github.io/posts/bitcask/"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "Sunby's Blog",
+    "logo": {
+      "@type": "ImageObject",
+      "url": "http://sunby.github.io/favicon.ico"
+    }
+  }
+}
+</script>
+</head>
+
+<body class="" id="top">
+<script>
+    if (localStorage.getItem("pref-theme") === "dark") {
+        document.body.classList.add('dark');
+    }
+
+</script>
+
+<header class="header">
+    <nav class="nav">
+        <div class="logo">
+            <a href="http://sunby.github.io/" accesskey="h" title="Sunby&#39;s Blog (Alt + H)">Sunby&#39;s Blog</a>
+            <div class="logo-switches">
+                <button id="theme-toggle" accesskey="t" title="(Alt + T)">
+                    <svg id="moon" xmlns="http://www.w3.org/2000/svg" width="24" height="18" viewBox="0 0 24 24"
+                        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round">
+                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+                    </svg>
+                    <svg id="sun" xmlns="http://www.w3.org/2000/svg" width="24" height="18" viewBox="0 0 24 24"
+                        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="5"></circle>
+                        <line x1="12" y1="1" x2="12" y2="3"></line>
+                        <line x1="12" y1="21" x2="12" y2="23"></line>
+                        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+                        <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+                        <line x1="1" y1="12" x2="3" y2="12"></line>
+                        <line x1="21" y1="12" x2="23" y2="12"></line>
+                        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+                        <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <ul id="menu">
+            <li>
+                <a href="http://sunby.github.io/archives/" title="Archives">
+                    <span>Archives</span>
+                </a>
+            </li>
+            <li>
+                <a href="http://sunby.github.io/search/" title="Search (Alt &#43; /)" accesskey=/>
+                    <span>Search</span>
+                </a>
+            </li>
+            <li>
+                <a href="http://sunby.github.io/tags/" title="Tags">
+                    <span>Tags</span>
+                </a>
+            </li>
+            <li>
+                <a href="http://sunby.github.io/about/" title="About">
+                    <span>About</span>
+                </a>
+            </li>
+        </ul>
+    </nav>
+</header>
+<main class="main">
+
+<article class="post-single">
+  <header class="post-header">
+    <div class="breadcrumbs"><a href="http://sunby.github.io/">Home</a>&nbsp;»&nbsp;<a href="http://sunby.github.io/posts/">Posts</a></div>
+    <h1 class="post-title">
+      Bitcask
+    </h1>
+    <div class="post-meta"><span title='2022-09-28 22:02:16 +0800 CST'>September 28, 2022</span>&nbsp;·&nbsp;1 min
+
+</div>
+  </header> <div class="toc">
+    <details >
+        <summary accesskey="c" title="(Alt + C)">
+            <span class="details">Table of Contents</span>
+        </summary>
+
+        <div class="inner"><ul>
+                <li>
+                    <a href="#0" aria-label="0">0</a></li>
+                <li>
+                    <a href="#bitcask" aria-label="Bitcask">Bitcask</a><ul>
+                        
+                <li>
+                    <a href="#%e9%9c%80%e6%b1%82" aria-label="需求">需求</a></li>
+                <li>
+                    <a href="#%e8%ae%be%e8%ae%a1" aria-label="设计">设计</a></li></ul>
+                </li>
+                <li>
+                    <a href="#%e4%b8%80%e4%ba%9b%e4%b8%8d%e6%88%90%e7%86%9f%e7%9a%84%e6%83%b3%e6%b3%95" aria-label="一些不成熟的想法">一些不成熟的想法</a></li>
+                <li>
+                    <a href="#%e6%80%bb%e7%bb%93" aria-label="总结">总结</a></li>
+                <li>
+                    <a href="#%e5%8f%82%e8%80%83%e6%96%87%e7%8c%ae" aria-label="参考文献">参考文献</a>
+                </li>
+            </ul>
+        </div>
+    </details>
+</div>
+
+  <div class="post-content"><h2 id="0">0<a hidden class="anchor" aria-hidden="true" href="#0">#</a></h2>
+<p>首先先吹一下<a href="https://dataintensive.net/">DDIA</a>这本书，众所周知这确实是本好书，特别适合反复阅读，每次读都会有新的体会，毕竟凭我的记忆力，看一遍是肯定记不住的😂。除了书中具体内容之外，每章后面的参考文献也给出了一些经典的论文，非常值得重复阅读，很多设计思想和工业界的实践对于工作中的大多数case都是很有帮助的，毕竟你遇到的坑，大概率已经有前人踩过了。</p>
+<p>前两天下班路上闲得无聊，又找出来翻了翻，在读第三章介绍索引篇章的时候发现，之前阅读的时候对LSM Tree和BTree比较关注，选择性忽略了讲HashTable的内容。作者在介绍HashTable作为索引提及了Bitcask，正好前两天在Github看到有人借鉴Bitcask写的项目，加上我也没有看过Bitcask的具体设计，于是趁这次把Bitcask熟悉了一下。</p>
+<p><a href="https://riak.com/assets/bitcask-intro.pdf">这篇论文</a>介绍了Bitcask的设计思想，比较简短，最多花15分钟就能读完，虽然Bitcask设计不算复杂，但是感觉其作为特定场景特定需求下的产物还是挺有趣的，于是想记录下来方便之后查阅。</p>
+<h2 id="bitcask">Bitcask<a hidden class="anchor" aria-hidden="true" href="#bitcask">#</a></h2>
+<h3 id="需求">需求<a hidden class="anchor" aria-hidden="true" href="#需求">#</a></h3>
+<p>Bitcask是Riak的本地存储引擎，在介绍其设计之前先来看一下需求是什么。</p>
+<p>下图是Bitcask的API，我们看到除了open、close、merge、sync等直接操作数据库和文件的接口之外，主要接口有get、put、delete、list_keys、fold等几个。其中get、put、delete都是针对指定key的操作，list_keys和fold是对所有数据的操作。我们可以发现Bitcask除了点查和全量查询，没有提供范围查询的接口，这也正符合了Bitcask通过HashTable作为索引的设计思想。</p>
+<p><img loading="lazy" src="/bitcask/bitcask_api.png#center" alt="bitcask_api"  />
+</p>
+<p>除了基本的API外，Bitcask需要处理内存不能完全容纳的数据量，以及满足低延迟、高吞吐、恢复快、易备份等等需求。</p>
+<h3 id="设计">设计<a hidden class="anchor" aria-hidden="true" href="#设计">#</a></h3>
+<p>既然内存不能存下所有的数据，那必然需要将文件存储在磁盘，我们先来看下底层文件存储格式是怎样的。</p>
+<p>Bitcask同时只允许有一个可写文件（active file），每条数据以append的形式添加到active file最后，如果active file超过了一定大小，会被close然后生成一个新的active file。每个file其实就是一个日志文件，由于Bitcask的索引是纯内存的形式，也就不需要像LSM Tree或者BTree一样维护WAL+data file这种形式，只要每次重启去恢复内存索引就够了。</p>
+<p><img loading="lazy" src="/bitcask/files_on_disk.png#center" alt="files_on_disk"  />
+</p>
+<p>每条记录的format如下图所示，如果是delete记录，其value是一个tombstone。</p>
+<p><img loading="lazy" src="/bitcask/entry_layout.png#center" alt="entry_format"  />
+</p>
+<p>随着update和delete操作的增加，data file会包含很多过期的entry，Bitcask通过merge（compaction）来合并老的文件，生成新的文件，只保留最新版本的数据。除了生成新的文件外，还会生成一个hint file，hint file没有记录具体的value，只记录了value pos和size，主要用来加速恢复。</p>
+<p><img loading="lazy" src="/bitcask/merge_process.png#center" alt="merge_process"  />
+</p>
+<p>Bitcask的内存维护一个成为keydir的HashTable索引结构，每一个key对应最新版本的数据信息，包括所在的fileid、value pos、value size和timestamp，从而可以方便地解析出value。</p>
+<p><img loading="lazy" src="/bitcask/in-memory_structure.png#center" alt="in-memory_structure"  />
+</p>
+<p>读操作流程如下图所示</p>
+<ol>
+<li>通过keydir找到查询的key</li>
+<li>解析fileid、value pos和value size</li>
+<li>从data file解析出对应的value</li>
+</ol>
+<p>可以看到，Bitcask的查询都是随机读，如果没有缓存，只是依赖系统的page cache，可能会影响查询的效率。另外对于fold这种需要扫全表的操作，如果全部转成随机读效率也是非常低的。</p>
+<p><img loading="lazy" src="/bitcask/read_process.png#center" alt="read_process"  />
+</p>
+<p>对于写操作：</p>
+<ol>
+<li>写入active file</li>
+<li>更新keydir</li>
+</ol>
+<p>恢复流程也很简单，遍历所有文件，如果有hint file就读hint file，如果没有就读原文件。</p>
+<h2 id="一些不成熟的想法">一些不成熟的想法<a hidden class="anchor" aria-hidden="true" href="#一些不成熟的想法">#</a></h2>
+<p>还没来得及看Bitcask源码，只是在读论文的过程中有一些简单的想法。</p>
+<ol>
+<li>关于缓存</li>
+</ol>
+<p>通常来说，如果一个数据库追求性能，一般不会使用操作系统的缓存而是自己来实现，好处是数据库内部更容易知道什么时候是合适的刷盘/换页时机，减少io请求，高效利用缓存。但是Bitcask的设计者考虑到实现内部缓存不确定能带来多大的回报，所以仍然使用文件系统缓存。当然这是10多年前的论文了，现在可能早就实现了自己的缓存管理（未考证）。另外，论文也提到Bitcask本身目标就不是作为一个最快的数据库来进行开发的，而是在有足够的性能的情况下，更多考虑高质量和简单的代码和设计。结合工作中遇到的问题，这点让我感同身受，如果整个项目还在一个复杂、不稳定、低质量代码的泥淖中挣扎，最关键的因素是把复杂度降到可控范围而不是一味的追求更多的功能和更快的性能，不把腿从泥潭里拔出来，跑相同的距离只会浪费更多的体力。</p>
+<ol start="2">
+<li>compaction</li>
+</ol>
+<p>论文讲compaction的时候比较简单，只说了将所有老文件合并成一个新的文件，但是这样做的缺点很明显，写放大会很高，而且在过程中会影响到前台的查询。LSM Tree结构的数据库的compaction除了删除过期数据外，还有个考虑是为了提高查询效率。在Bitcask中不需要考虑查询效率，重点在于如何高效删除过期数据，减小写放大。一个想法是可以统计更新/删除操作相对于整体数据量的比例，来作为触发compaction的一个条件，只有当比例比较高的时候才去做compaction。这个比例如果太小，写放大会很严重；如果太大，恢复时间会较长，需要通过实际测试和使用场景来确定。</p>
+<ol start="3">
+<li>恢复</li>
+</ol>
+<p>论文讲恢复的时候说会把所有文件都读一遍，然后尝试添加到keydir里面，其实可以记录一下文件属性，比如timestamp range。在恢复的时候从较新的文件开始，如果一个key在多个文件里都有，之前已经读到了这个key的update或delete，之后在较老的文件里就可以略过，加快恢复的速度。</p>
+<ol start="4">
+<li>fold</li>
+</ol>
+<p>如果数据量很大，大量的随机读会严重影响查询性能。</p>
+<ol start="5">
+<li>其他</li>
+</ol>
+<p>在一些容忍丢失数据的场景下，可以合并写入；数据压缩。</p>
+<h2 id="总结">总结<a hidden class="anchor" aria-hidden="true" href="#总结">#</a></h2>
+<p>Bitcask不是一个全能的数据库，而是为了满足特定需求设计的。Bitcask的设计非常精炼，实现了log-structured file 实现了高效的写入，通过in-memory hash table实现了高效读取。但是使用场景比较有限，内存必须要容纳下所有的key。个人觉得比较适合拿来练手，熟悉磁盘文件管理、读写、并发。</p>
+<h2 id="参考文献">参考文献<a hidden class="anchor" aria-hidden="true" href="#参考文献">#</a></h2>
+<ol>
+<li><a href="https://riak.com/assets/bitcask-intro.pdf">https://riak.com/assets/bitcask-intro.pdf</a></li>
+</ol>
+
+
+  </div>
+
+  <footer class="post-footer">
+    <ul class="post-tags">
+      <li><a href="http://sunby.github.io/tags/paper/">Paper</a></li>
+      <li><a href="http://sunby.github.io/tags/database/">Database</a></li>
+    </ul>
+<nav class="paginav">
+  <a class="next" href="http://sunby.github.io/posts/2021-12-31-2021_summary/">
+    <span class="title">Next »</span>
+    <br>
+    <span>2021 年终总结</span>
+  </a>
+</nav>
+
+  </footer><script src="https://utteranc.es/client.js"
+        repo="sunby/sunby.github.io"
+        issue-term="title"
+        theme="github-light"
+        crossorigin="anonymous"
+        async>
+</script>
+
+</article>
+    </main>
+    
+<footer class="footer">
+    <span>&copy; 2022 <a href="http://sunby.github.io/">Sunby&#39;s Blog</a></span>
+    <span>
+        Powered by
+        <a href="https://gohugo.io/" rel="noopener noreferrer" target="_blank">Hugo</a> &
+        <a href="https://github.com/adityatelange/hugo-PaperMod/" rel="noopener" target="_blank">PaperMod</a>
+    </span>
+</footer>
+<a href="#top" aria-label="go to top" title="Go to Top (Alt + G)" class="top-link" id="top-link" accesskey="g">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 6" fill="currentColor">
+        <path d="M12 6H0l6-6z" />
+    </svg>
+</a>
+
+<script>
+    let menu = document.getElementById('menu')
+    if (menu) {
+        menu.scrollLeft = localStorage.getItem("menu-scroll-position");
+        menu.onscroll = function () {
+            localStorage.setItem("menu-scroll-position", menu.scrollLeft);
+        }
+    }
+
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener("click", function (e) {
+            e.preventDefault();
+            var id = this.getAttribute("href").substr(1);
+            if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                document.querySelector(`[id='${decodeURIComponent(id)}']`).scrollIntoView({
+                    behavior: "smooth"
+                });
+            } else {
+                document.querySelector(`[id='${decodeURIComponent(id)}']`).scrollIntoView();
+            }
+            if (id === "top") {
+                history.replaceState(null, null, " ");
+            } else {
+                history.pushState(null, null, `#${id}`);
+            }
+        });
+    });
+
+</script>
+<script>
+    var mybutton = document.getElementById("top-link");
+    window.onscroll = function () {
+        if (document.body.scrollTop > 800 || document.documentElement.scrollTop > 800) {
+            mybutton.style.visibility = "visible";
+            mybutton.style.opacity = "1";
+        } else {
+            mybutton.style.visibility = "hidden";
+            mybutton.style.opacity = "0";
+        }
+    };
+
+</script>
+<script>
+    document.getElementById("theme-toggle").addEventListener("click", () => {
+        if (document.body.className.includes("dark")) {
+            document.body.classList.remove('dark');
+            localStorage.setItem("pref-theme", 'light');
+        } else {
+            document.body.classList.add('dark');
+            localStorage.setItem("pref-theme", 'dark');
+        }
+    })
+
+</script>
+<script>
+    document.querySelectorAll('pre > code').forEach((codeblock) => {
+        const container = codeblock.parentNode.parentNode;
+
+        const copybutton = document.createElement('button');
+        copybutton.classList.add('copy-code');
+        copybutton.innerHTML = 'copy';
+
+        function copyingDone() {
+            copybutton.innerHTML = 'copied!';
+            setTimeout(() => {
+                copybutton.innerHTML = 'copy';
+            }, 2000);
+        }
+
+        copybutton.addEventListener('click', (cb) => {
+            if ('clipboard' in navigator) {
+                navigator.clipboard.writeText(codeblock.textContent);
+                copyingDone();
+                return;
+            }
+
+            const range = document.createRange();
+            range.selectNodeContents(codeblock);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            try {
+                document.execCommand('copy');
+                copyingDone();
+            } catch (e) { };
+            selection.removeRange(range);
+        });
+
+        if (container.classList.contains("highlight")) {
+            container.appendChild(copybutton);
+        } else if (container.parentNode.firstChild == container) {
+            
+        } else if (codeblock.parentNode.parentNode.parentNode.parentNode.parentNode.nodeName == "TABLE") {
+            
+            codeblock.parentNode.parentNode.parentNode.parentNode.parentNode.appendChild(copybutton);
+        } else {
+            
+            codeblock.parentNode.appendChild(copybutton);
+        }
+    });
+</script>
+</body>
+
+</html>

@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/">
   <channel>
-    <title>Posts on Sunby&#39;s Blog</title>
-    <link>http://sunby.github.io/posts/</link>
-    <description>Recent content in Posts on Sunby&#39;s Blog</description>
+    <title>Database on Sunby&#39;s Blog</title>
+    <link>http://sunby.github.io/tags/database/</link>
+    <description>Recent content in Database on Sunby&#39;s Blog</description>
     <generator>Hugo -- gohugo.io</generator>
     <language>en-us</language>
-    <lastBuildDate>Wed, 28 Sep 2022 22:02:16 +0800</lastBuildDate><atom:link href="http://sunby.github.io/posts/index.xml" rel="self" type="application/rss+xml" />
+    <lastBuildDate>Wed, 28 Sep 2022 22:02:16 +0800</lastBuildDate><atom:link href="http://sunby.github.io/tags/database/index.xml" rel="self" type="application/rss+xml" />
     <item>
       <title>Bitcask</title>
       <link>http://sunby.github.io/posts/bitcask/</link>
@@ -36,25 +36,6 @@ fold 如果数据量很大，大量的随机读会严重影响查询性能。
 其他 在一些容忍丢失数据的场景下，可以合并写入；数据压缩。
 总结 Bitcask不是一个全能的数据库，而是为了满足特定需求设计的。Bitcask的设计非常精炼，实现了log-structured file 实现了高效的写入，通过in-memory hash table实现了高效读取。但是使用场景比较有限，内存必须要容纳下所有的key。个人觉得比较适合拿来练手，熟悉磁盘文件管理、读写、并发。
 参考文献 https://riak.com/assets/bitcask-intro.pdf </description>
-    </item>
-    
-    <item>
-      <title>2021 年终总结</title>
-      <link>http://sunby.github.io/posts/2021-12-31-2021_summary/</link>
-      <pubDate>Fri, 31 Dec 2021 16:00:33 +0800</pubDate>
-      
-      <guid>http://sunby.github.io/posts/2021-12-31-2021_summary/</guid>
-      <description>从毕业以来感觉最明显的一件事就是记忆力衰退得很严重，比如今天在B站看年终混剪的时候，仿佛有些事情过去了好久，不像在今年发生的；又比如以前不需要做任何笔记都可以大概记住自己看过的东西，而今年看过的书和课很多都忘的差不多了。
-工作的主要精力都放在了Milvus上面，因为Milvus开始学习和熟悉Go，Go对于新手来说还是比较容易上手的，但是写得好和简单没有什么必然联系，我看过让我感觉很惊艳的代码，也写过烂的不想承认是自己写的代码。因此在年初到年中很长一段时间内，持续学习了如何写出好代码，包括但不限于《Clean Code》、设计模式相关以及一些Go相关的best practice文章，算是有些小的收获，但自我感觉对于Go这个语言的理解还只处于30%-40%的水平，仍需精进。
-Milvus这个项目想说的有很多（总结里就不写优点了，主要写一下思考和不足），作为一个迭代到2.0版本（或者说重新做2.0版本）的项目来说，这个项目似乎承担了比想象中更多的技术债，开发者有些疲于处理进度与代码质量之间的平衡，似乎慢慢缺失了一些敬畏和责任。作为一个开源项目，不应该让自己的能力只能做到这种程度，或者说甚至没有意识到应该做到什么样子才算“合格”。作为我本人来讲，我只能尽量让自己少做无用功，尽量让自己专注。经常困扰我自身的一点是，我能够感觉到这样做不对，但是却不能明确提出如何做是对的，后来发现，我们工程上面的问题，大多数人其实都遇到了并且给出了可行的方案，我们要做的就是结合自己的问题来优化和实现，这样做起码可以让自己解放出来，少一些试错以及重构的时间，多读多看别人的代码是相当有效的。实际一点，项目的基础不牢，比如对于依赖组件的理解不深，包括设计理念和最佳实践；抽象做的不好，很多人都不是写Go出身的，但这不应该成为理由；单测写的不好。
-在工作中产生了一些困惑，带着多学习优秀开源项目的想法，读了一些TiDB和PD的代码，也从中学习到了一些Go的规范和实践。由于和之前的工作非常相关，最近想学习一下TiKV，所以开始抽空看Rust，先挖个坑，学习Rust之后再来写一篇总结。除此之外，今年上半年把Andy的15-445基本上完了，感慨于Andy作为一个大佬，讲课讲的超级棒，回想起自己本科时上的课，真想告诉那时候的自己，去学习一下国外的课程会获得更多的收获，但是就像前面说的，不做笔记和总结总是忘的很快，可能是正常现象，之后抽空去做一下lab再开个总结吧（坑+1）。DDIA也断断续续的读了个差不多，这本书我觉得最有价值的一点不在于讲的技术多么深，而是他把比较常见的技术做了一遍梳理，让我能够清楚的看到自己哪里理解的很浅，而且给出了大量的文献，这些才是这本书读完后对症下药去精进的地方。
-今年比较重要的事情是搬进了新家，算上装修、买家具和散味断断续续搞了一年，周末大多数时间也是花费在了这里，上班通勤时间虽然变长了，但是路上时间给了我一大段时间去阅读和思考，急需一个Kindle😄。
-今年和璐璐的感情可以说是命途多舛的一年，感情进展到特定阶段会遇到一些分歧，在这个过程中自己的心态也发生了变化。这些事情早晚要经历，所幸目前处理得还算不错，两个人还是能够分清什么是最重要的，希望明年可以和璐璐在感情和事业上都会有比较大的突破。今年去了一次璐璐家乡桂林，山水确实美，正好遇到灯节，拍了为数不多的几张照片。
-今年的运动量少的可怜，主要是懒得过分了，不喜欢出门，明年希望可以多出去旅游几次，学一下摄影，多拍一些能够留下纪念的照片。还有就是要运动起来，减缓一下健康焦虑。今年明显能够感觉精神压力大了许多，不只是工作上面，虽然这句话说的有点早，但是年龄焦虑也愈发明显，自己也知道有点过度焦虑，但还是难以调节，干脆把它作为激励自己的一种情绪，把悲观的影响降到最小。
-技术上明年希望把Milvus做到一个在我这里“合格”的程度，这个度量很难把握，但是至少现在还差的很远。希望可以为其他项目多贡献一些代码，主要专注于Rust和Go的学习方面。另外比较重要的一点，论文的阅读和总结要开始做起来，之前想写一篇Dynamo的总结，拖了好久，感觉怎么写怎么不对，写文章像是在做笔记，自己的文笔退化非常严重，令人窒息。
-在2021年最后一天把Blog的第一篇文章发出来，记录分享自己的学习工作生活，很久之前就想搞，但是大多都写在了自己的notes里，希望这是个好的开始，慢慢把Blog丰富起来。
-最后，希望疫情快点结束，世界和平🕊️。
-参考资料 https://github.com/milvus-io/milvus https://15445.courses.cs.cmu.edu/fall2021/ https://github.com/pingcap/tidb https://github.com/tikv/pd https://github.com/tikv/tikv https://dataintensive.net/ </description>
     </item>
     
   </channel>
